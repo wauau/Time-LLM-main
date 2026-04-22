@@ -6,6 +6,8 @@ from layers.Embed import PatchEmbedding
 from layers.StandardNorm import Normalize
 from math import sqrt
 import transformers
+from models.llm_external_model import LLMSemanticFeatureGenerator
+from models.fusion_modules import DynamicFusionModule
 
 transformers.logging.set_verbosity_error()
 
@@ -264,6 +266,7 @@ class EnhancedTimeLLM(nn.Module):
     """
     def __init__(self, configs, patch_len=16, stride=8):
         super(EnhancedTimeLLM, self).__init__()
+        self.configs = configs
         self.task_name = configs.task_name
         self.pred_len = configs.pred_len
         self.seq_len = configs.seq_len
@@ -273,12 +276,22 @@ class EnhancedTimeLLM(nn.Module):
         self.patch_len = configs.patch_len
         self.stride = configs.stride
         
+        # 实验配置
+        self.use_external_factors = getattr(configs, 'use_external_factors', True)
+        self.use_llm_semantic = getattr(configs, 'use_llm_semantic', True)
+        self.use_fusion = getattr(configs, 'use_fusion', True)
+        
         # 初始化LLM
         self._init_llm(configs)
         
-        # 语义Prompt构造器
-        task_desc = configs.content if hasattr(configs, 'prompt_domain') and configs.prompt_domain else "People flow forecasting"
-        self.prompt_constructor = SemanticPromptConstructor(task_desc, self.pred_len, self.seq_len)
+        # LLM语义特征生成器
+        self.llm_semantic_generator = LLMSemanticFeatureGenerator(configs)
+        
+        # 动态融合模块：使用LLM隐藏状态维度
+        self.dynamic_fusion = DynamicFusionModule(self.d_llm, configs.n_heads, configs.dropout)
+        
+        # 维度投影层：将语义特征维度映射到LLM隐藏状态维度
+        self.dimension_projection = nn.Linear(configs.d_model, self.d_llm)
         
         # Patch嵌入
         self.patch_embedding = PatchEmbedding(
@@ -293,19 +306,13 @@ class EnhancedTimeLLM(nn.Module):
         # 重编程层
         self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
         
-        # 自适应融合模块
-        self.use_cross_attention = getattr(configs, 'use_cross_attention', True)
-        if self.use_cross_attention:
-            self.fusion_module = CrossAttentionFusion(self.d_ff, configs.n_heads, self.d_ff, configs.dropout)
-        else:
-            self.fusion_module = SimilarityAlignmentFusion(self.d_ff, configs.dropout)
-        
-        # 外部因素嵌入
+        # 外部因素嵌入（仅当不使用LLM语义时）
         self.external_embedding = nn.Linear(4, self.d_ff)  # weather: 3 features + holiday: 1 feature
         
         # 输出投影
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
-        self.head_nf = self.d_ff * self.patch_nums
+        # 使用d_model作为特征维度，因为我们将在融合后使用d_model维度
+        self.head_nf = configs.d_model * self.patch_nums
         
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
@@ -322,50 +329,43 @@ class EnhancedTimeLLM(nn.Module):
     def _init_llm(self, configs):
         """初始化LLM模型"""
         if configs.llm_model == 'BERT':
-            self.bert_config = BertConfig.from_pretrained('google-bert/bert-base-uncased')
-            self.bert_config.num_hidden_layers = configs.llm_layers
-            self.bert_config.output_attentions = True
-            self.bert_config.output_hidden_states = True
+            # 直接创建BERT配置
+            self.bert_config = BertConfig(
+                vocab_size=30522,
+                hidden_size=768,
+                num_hidden_layers=configs.llm_layers,
+                num_attention_heads=12,
+                intermediate_size=3072,
+                hidden_act="gelu",
+                hidden_dropout_prob=0.1,
+                attention_probs_dropout_prob=0.1,
+                max_position_embeddings=512,
+                type_vocab_size=2,
+                initializer_range=0.02,
+                layer_norm_eps=1e-12,
+                output_attentions=True,
+                output_hidden_states=True
+            )
             
-            try:
-                self.llm_model = BertModel.from_pretrained(
-                    'google-bert/bert-base-uncased',
-                    trust_remote_code=True,
-                    local_files_only=True,
-                    config=self.bert_config,
-                )
-            except EnvironmentError:
-                print("Local model files not found. Attempting to download...")
-                self.llm_model = BertModel.from_pretrained(
-                    'google-bert/bert-base-uncased',
-                    trust_remote_code=True,
-                    local_files_only=False,
-                    config=self.bert_config,
-                )
+            # 创建BERT模型实例
+            self.llm_model = BertModel(self.bert_config)
+            print("Created BERT model with random weights")
             
-            try:
-                self.tokenizer = BertTokenizer.from_pretrained(
-                    'google-bert/bert-base-uncased',
-                    trust_remote_code=True,
-                    local_files_only=True
-                )
-            except EnvironmentError:
-                print("Local tokenizer files not found. Attempting to download...")
-                self.tokenizer = BertTokenizer.from_pretrained(
-                    'google-bert/bert-base-uncased',
-                    trust_remote_code=True,
-                    local_files_only=False
-                )
+            # 创建BERT tokenizer
+            from transformers import BertTokenizerFast
+            self.tokenizer = BertTokenizerFast(
+                vocab_file=None,
+                do_lower_case=True,
+                strip_accents=True,
+                tokenize_chinese_chars=False,
+                wordpiece_prefix="##"
+            )
+            # 添加特殊 tokens
+            special_tokens = {'pad_token': '[PAD]', 'cls_token': '[CLS]', 'sep_token': '[SEP]'}
+            self.tokenizer.add_special_tokens(special_tokens)
+            print("Created BERT tokenizer with basic configuration")
         else:
             raise Exception('Only BERT is supported in EnhancedTimeLLM')
-        
-        # 设置pad token
-        if self.tokenizer.eos_token:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        else:
-            pad_token = '[PAD]'
-            self.tokenizer.add_special_tokens({'pad_token': pad_token})
-            self.tokenizer.pad_token = pad_token
         
         # 冻结LLM参数
         for param in self.llm_model.parameters():
@@ -415,13 +415,13 @@ class EnhancedTimeLLM(nn.Module):
         
         return external_factors
     
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors)
             return dec_out[:, -self.pred_len:, :]
         return None
     
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
         # 归一化
         x_enc = self.normalize_layers(x_enc, 'norm')
         
@@ -435,27 +435,8 @@ class EnhancedTimeLLM(nn.Module):
         lags = self.calcute_lags(x_enc)
         trends = x_enc.diff(dim=1).sum(dim=1)
         
-        # 构造统计特征字典
-        batch_stats = {
-            'min_values': min_values.squeeze(-1).cpu().numpy(),
-            'max_values': max_values.squeeze(-1).cpu().numpy(),
-            'median_values': medians.squeeze(-1).cpu().numpy(),
-            'trends': trends.squeeze(-1).cpu().numpy(),
-            'lags': lags.cpu().numpy()
-        }
-        
-        # 提取外部因素
-        external_factors = self.extract_external_factors(x_mark_enc)
-        
-        # 构造语义Prompt
-        prompts = self.prompt_constructor.construct_prompt(batch_stats, external_factors)
-        
         # 恢复x_enc形状
         x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
-        
-        # 生成Prompt embedding
-        prompt = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
-        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))
         
         # 时序特征提取
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
@@ -465,29 +446,66 @@ class EnhancedTimeLLM(nn.Module):
         # 重编程
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         
-        # 外部因素嵌入
-        if x_mark_enc.shape[-1] >= 4:
-            external_emb = self.external_embedding(x_mark_enc[:, :, :4])
-            external_emb = external_emb.mean(dim=1, keepdim=True).repeat(1, enc_out.shape[1], 1)
-        else:
-            external_emb = torch.zeros_like(enc_out)
+        # 处理外部因素
+        semantic_features = None
+        impact_scores = None
         
-        # 自适应融合
-        if self.use_cross_attention:
-            fused_features, attention_weights = self.fusion_module(enc_out, external_emb)
-        else:
-            # 对齐特征长度
-            min_len = min(enc_out.shape[1], external_emb.shape[1])
-            enc_out_aligned = enc_out[:, :min_len, :]
-            external_emb_aligned = external_emb[:, :min_len, :]
-            fused_features, similarity_weights = self.fusion_module(enc_out_aligned, external_emb_aligned)
+        if self.use_external_factors:
+            if self.use_llm_semantic and external_factors is not None:
+                # 使用LLM语义建模外部因素
+                semantic_features, impact_scores = self.llm_semantic_generator.llm_external_model(external_factors)
+                # 投影到d_model维度
+                semantic_features = self.dimension_projection(semantic_features)
+            else:
+                # 传统外部因素嵌入
+                if x_mark_enc.shape[-1] >= 4:
+                    semantic_features = self.external_embedding(x_mark_enc[:, :, :4])
+                    semantic_features = semantic_features.mean(dim=1, keepdim=True).repeat(1, enc_out.shape[1], 1)
+                else:
+                    semantic_features = torch.zeros_like(enc_out)
+        
+        # 动态融合
+        if self.use_fusion and semantic_features is not None:
+            enc_out, fusion_weights = self.dynamic_fusion(enc_out, semantic_features, impact_scores)
+        
+        # 生成Prompt embedding（使用统计特征）
+        batch_stats = {
+            'min_values': min_values.squeeze(-1).cpu().numpy(),
+            'max_values': max_values.squeeze(-1).cpu().numpy(),
+            'median_values': medians.squeeze(-1).cpu().numpy(),
+            'trends': trends.squeeze(-1).cpu().numpy(),
+            'lags': lags.cpu().numpy()
+        }
+        
+        # 构造基础Prompt
+        prompts = []
+        for b in range(B):
+            prompt_parts = [
+                f"<|start_prompt|>",
+                "Task: People flow forecasting",
+                f"Forecast the next {self.pred_len} steps given the previous {self.seq_len} steps information.",
+                "Historical Statistics:",
+                f"- Min value: {batch_stats['min_values'][b]:.2f}",
+                f"- Max value: {batch_stats['max_values'][b]:.2f}",
+                f"- Median value: {batch_stats['median_values'][b]:.2f}",
+                f"- Trend: {'upward' if batch_stats['trends'][b] > 0 else 'downward'}",
+                f"- Top 5 lags: {batch_stats['lags'][b]}",
+                "Prediction Target: People flow in the next time steps.",
+                "<|end_prompt|>"
+            ]
+            prompts.append(" ".join(prompt_parts))
+        
+        # 生成Prompt embedding
+        prompt = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).input_ids
+        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))
         
         # 拼接prompt embedding和融合特征
-        llama_enc_out = torch.cat([prompt_embeddings, fused_features], dim=1)
+        llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         
         # LLM处理
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
-        dec_out = dec_out[:, :, :self.d_ff]
+        # 使用configs.d_model作为特征维度
+        dec_out = dec_out[:, :, :self.configs.d_model]
         
         # 重塑和投影
         dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
