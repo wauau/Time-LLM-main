@@ -1,0 +1,20 @@
+# Time-LLM 项目依赖
+
+# 核心依赖
+pandas==1.5.3
+numpy==1.23.5
+matplotlib==3.7.0
+scikit-learn==1.2.2
+statsmodels==0.14.0
+
+# 深度学习
+torch==2.2.2
+transformers==4.30.0
+
+# 可视化
+streamlit==1.32.0
+plotly==5.18.0
+
+# 其他
+tabulate==0.10.0
+requests==2.27.1
