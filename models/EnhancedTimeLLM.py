@@ -7,7 +7,7 @@ from layers.StandardNorm import Normalize
 from math import sqrt
 import transformers
 from models.llm_external_model import LLMSemanticFeatureGenerator
-from models.fusion_modules import DynamicFusionModule
+from models.fusion_modules import DynamicFusionModule, GateFusion, AttentionFusion
 
 transformers.logging.set_verbosity_error()
 
@@ -263,6 +263,7 @@ class SimilarityAlignmentFusion(nn.Module):
 class EnhancedTimeLLM(nn.Module):
     """
     增强版TimeLLM：LLM语义驱动 + 外因影响自适应建模
+    明确分离四个模块：时间序列分支、LLM外因分支、融合层、预测层
     """
     def __init__(self, configs, patch_len=16, stride=8):
         super(EnhancedTimeLLM, self).__init__()
@@ -280,57 +281,323 @@ class EnhancedTimeLLM(nn.Module):
         self.use_external_factors = getattr(configs, 'use_external_factors', True)
         self.use_llm_semantic = getattr(configs, 'use_llm_semantic', True)
         self.use_fusion = getattr(configs, 'use_fusion', True)
+        self.fusion_mode = getattr(configs, 'fusion_mode', 'attention')  # attention, gate, concat
         
-        # 初始化LLM
-        self._init_llm(configs)
+        # 对比实验模式
+        self.experiment_mode = getattr(configs, 'experiment_mode', 'full')  # full, no_external, simple_concat, llm_only
         
-        # LLM语义特征生成器
-        self.llm_semantic_generator = LLMSemanticFeatureGenerator(configs)
+        # 根据实验模式设置参数
+        if self.experiment_mode == 'no_external':
+            # 无外因模式
+            self.use_external_factors = False
+        elif self.experiment_mode == 'simple_concat':
+            # 简单拼接模式
+            self.use_external_factors = True
+            self.use_llm_semantic = False
+            self.use_fusion = True
+            self.fusion_mode = 'concat'
+        elif self.experiment_mode == 'llm_only':
+            # LLM外因模式（无融合）
+            self.use_external_factors = True
+            self.use_llm_semantic = True
+            self.use_fusion = False
         
-        # 动态融合模块：使用LLM隐藏状态维度
-        self.dynamic_fusion = DynamicFusionModule(self.d_llm, configs.n_heads, configs.dropout)
+        # 1. 时间序列分支
+        self.temporal_branch = TemporalBranch(configs, self.patch_len, self.stride)
         
-        # 维度投影层：将语义特征维度映射到LLM隐藏状态维度
-        self.dimension_projection = nn.Linear(configs.d_model, self.d_llm)
+        # 2. LLM外因分支
+        self.llm_external_branch = LLMSemanticFeatureGenerator(configs)
+        
+        # 3. 融合层
+        self.fusion_layer = FusionLayer(configs, self.d_llm)
+        
+        # 4. 预测层
+        self.prediction_layer = PredictionLayer(configs, self.patch_len, self.stride)
+        
+        # 归一化层
+        self.normalize_layers = Normalize(configs.enc_in, affine=False)
+    
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors)
+            return dec_out[:, -self.pred_len:, :]
+        return None
+    
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
+        # 归一化
+        x_enc = self.normalize_layers(x_enc, 'norm')
+        
+        B, T, N = x_enc.size()
+        
+        # 1. 时间序列分支：提取时序特征
+        temporal_features, batch_stats, n_vars = self.temporal_branch(x_enc)
+        
+        # 2. LLM外因分支：处理外部因素
+        semantic_features = None
+        impact_scores = None
+        factor_weights = None
+        
+        if self.use_external_factors:
+            if self.use_llm_semantic and external_factors is not None:
+                # 使用LLM语义建模外部因素
+                semantic_features, impact_scores, factor_weights = self.llm_external_branch.llm_external_model(external_factors)
+            else:
+                # 传统外部因素嵌入（简单拼接模式）
+                semantic_features = self.llm_external_branch.extract_and_embed_external_factors(x_mark_enc, temporal_features.shape[1])
+        
+        # 3. 融合层：生成融合特征X_fused
+        # 初始化为时序特征，当没有外部因素或不使用融合时直接使用时序特征
+        X_fused = temporal_features
+        fusion_weights = None
+        
+        if self.use_fusion and semantic_features is not None:
+            # 动态融合：X_fused = X_base + α·X_external
+            # 这里是X_fused的核心生成位置，通过可学习的融合机制将外部因素融入时序特征
+            X_fused, fusion_weights = self.fusion_layer(temporal_features, semantic_features, impact_scores, factor_weights, self.fusion_mode)
+        
+        # X_fused现在包含了融合后的特征，将用于后续的预测
+        
+        # 4. 预测层：使用融合特征进行预测
+        dec_out = self.prediction_layer(X_fused, batch_stats, n_vars, self.configs.d_model)
+        
+        # 反归一化
+        dec_out = self.normalize_layers(dec_out, 'denorm')
+        
+        return dec_out
+
+
+class TemporalBranch(nn.Module):
+    """
+    时间序列分支：负责提取时间序列特征
+    """
+    def __init__(self, configs, patch_len, stride):
+        super(TemporalBranch, self).__init__()
+        self.configs = configs
+        self.patch_len = patch_len
+        self.stride = stride
+        self.top_k = 5
         
         # Patch嵌入
         self.patch_embedding = PatchEmbedding(
-            configs.d_model, self.patch_len, self.stride, configs.dropout)
+            configs.d_model, patch_len, stride, configs.dropout)
         
         # 词嵌入映射
-        self.word_embeddings = self.llm_model.get_input_embeddings().weight
-        self.vocab_size = self.word_embeddings.shape[0]
-        self.num_tokens = 1000
-        self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
+        self.word_embeddings = None
+        self.mapping_layer = None
         
         # 重编程层
-        self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
+        self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, configs.d_ff, configs.llm_dim)
+    
+    def forward(self, x_enc):
+        """
+        前向传播
         
-        # 外部因素嵌入（仅当不使用LLM语义时）
-        self.external_embedding = nn.Linear(4, self.d_ff)  # weather: 3 features + holiday: 1 feature
+        参数:
+            x_enc: [B, T, N] 输入时间序列
         
-        # 输出投影
-        self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
-        # 使用d_model作为特征维度，因为我们将在融合后使用d_model维度
+        返回:
+            temporal_features: [B, L, D] 时序特征
+            batch_stats: dict 批次统计特征
+            n_vars: int 变量数量
+        """
+        B, T, N = x_enc.size()
+        x_enc_reshaped = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+        
+        # 计算统计特征
+        min_values = torch.min(x_enc_reshaped, dim=1)[0]
+        max_values = torch.max(x_enc_reshaped, dim=1)[0]
+        medians = torch.median(x_enc_reshaped, dim=1).values
+        lags = self.calcute_lags(x_enc_reshaped)
+        trends = x_enc_reshaped.diff(dim=1).sum(dim=1)
+        
+        # 恢复x_enc形状
+        x_enc = x_enc_reshaped.reshape(B, N, T).permute(0, 2, 1).contiguous()
+        
+        # 时序特征提取
+        if self.word_embeddings is None:
+            # 延迟初始化词嵌入，因为需要访问LLM模型
+            from transformers import BertModel, BertConfig
+            temp_config = BertConfig(
+                vocab_size=30522,
+                hidden_size=768,
+                num_hidden_layers=2,
+                num_attention_heads=12,
+                intermediate_size=3072
+            )
+            temp_model = BertModel(temp_config)
+            self.word_embeddings = temp_model.get_input_embeddings().weight
+            self.vocab_size = self.word_embeddings.shape[0]
+            self.num_tokens = 1000
+            self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens).to(x_enc.device)
+        
+        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
+        x_enc = x_enc.permute(0, 2, 1).contiguous()
+        enc_out, n_vars = self.patch_embedding(x_enc)
+        
+        # 重编程
+        temporal_features = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+        
+        # 构建批次统计特征
+        batch_stats = {
+            'min_values': min_values.squeeze(-1).cpu().numpy(),
+            'max_values': max_values.squeeze(-1).cpu().numpy(),
+            'median_values': medians.squeeze(-1).cpu().numpy(),
+            'trends': trends.squeeze(-1).cpu().numpy(),
+            'lags': lags.cpu().numpy()
+        }
+        
+        return temporal_features, batch_stats, n_vars
+    
+    def calcute_lags(self, x_enc):
+        q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
+        k_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
+        res = q_fft * torch.conj(k_fft)
+        corr = torch.fft.irfft(res, dim=-1)
+        mean_value = torch.mean(corr, dim=1)
+        _, lags = torch.topk(mean_value, self.top_k, dim=-1)
+        return lags
+
+
+class FusionLayer(nn.Module):
+    """
+    融合层：实现可学习的融合机制
+    """
+    def __init__(self, configs, d_llm):
+        super(FusionLayer, self).__init__()
+        self.configs = configs
+        self.d_llm = d_llm
+        
+        # 维度投影层：将语义特征维度映射到LLM隐藏状态维度
+        self.dimension_projection = nn.Linear(configs.d_model, d_llm)
+        
+        # 传统外部因素嵌入（仅用于简单拼接模式）
+        self.external_embedding = nn.Linear(4, d_llm)  # weather: 3 features + holiday: 1 feature
+        
+        # 动态融合模块
+        self.dynamic_fusion = DynamicFusionModule(d_llm, configs.n_heads, configs.dropout)
+        
+        # 门控融合模块
+        self.gate_fusion = GateFusion(d_llm, configs.dropout)
+        
+        # 注意力融合模块
+        self.attention_fusion = AttentionFusion(d_llm, configs.n_heads, configs.dropout)
+        
+        # 可学习的权重网络：用于生成融合权重α
+        self.weight_network = nn.Sequential(
+            nn.Linear(d_llm * 2, d_llm),
+            nn.ReLU(),
+            nn.Linear(d_llm, 1),
+            nn.Sigmoid()  # 输出0-1的权重
+        )
+        
+        # 因素权重融合网络
+        self.factor_weight_network = nn.Sequential(
+            nn.Linear(3, d_llm),
+            nn.ReLU(),
+            nn.Linear(d_llm, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, temporal_features, semantic_features, impact_scores=None, factor_weights=None, fusion_mode='attention'):
+        """
+        前向传播
+        
+        参数:
+            temporal_features: [B, L, D] 时序特征
+            semantic_features: [B, D] 或 [B, L, D] 语义特征
+            impact_scores: [B, 1] 影响程度分数
+            factor_weights: [B, 3] 多维权重向量（天气、节假日、时间）
+            fusion_mode: str 融合模式 ('attention', 'gate', 'concat')
+        
+        返回:
+            X_fused: [B, L, D] 融合后的特征
+            fusion_weights: 融合权重
+        """
+        B, L, D = temporal_features.shape
+        
+        # 处理语义特征形状
+        if semantic_features.dim() == 2:
+            # [B, D] -> [B, 1, D] -> [B, L, D]
+            semantic_features = semantic_features.unsqueeze(1).repeat(1, L, 1)
+        
+        # 投影到相同维度
+        if semantic_features.shape[-1] != D:
+            semantic_features = self.dimension_projection(semantic_features)
+        
+        # 生成可学习的融合权重α
+        # 方法1：使用时间特征和语义特征的拼接来预测权重
+        combined_features = torch.cat([temporal_features, semantic_features], dim=-1)
+        alpha = self.weight_network(combined_features)  # [B, L, 1]
+        
+        # 方法2：如果提供了factor_weights，结合因素权重调整融合权重
+        if factor_weights is not None:
+            # 处理因素权重
+            factor_alpha = self.factor_weight_network(factor_weights)  # [B, 1]
+            factor_alpha = factor_alpha.unsqueeze(1).repeat(1, L, 1)  # [B, L, 1]
+            # 结合两种权重
+            alpha = alpha * factor_alpha
+        
+        # 显式融合公式：X_fused = X_base + α·X_external
+        X_fused = temporal_features + alpha * semantic_features
+        
+        # 可选：使用其他融合模式进一步优化
+        if fusion_mode == 'attention':
+            # 使用注意力机制进一步融合
+            attention_fused, fusion_weights = self.attention_fusion(temporal_features, semantic_features)
+            # 结合注意力融合和显式融合
+            X_fused = 0.5 * X_fused + 0.5 * attention_fused
+        elif fusion_mode == 'gate':
+            # 使用门控机制进一步融合
+            gate_fused = self.gate_fusion(temporal_features, semantic_features, impact_scores)
+            # 结合门控融合和显式融合
+            X_fused = 0.5 * X_fused + 0.5 * gate_fused
+        elif fusion_mode == 'concat':
+            # 简单拼接（用于对比实验）
+            concat_fused = torch.cat([temporal_features, semantic_features], dim=-1)
+            concat_fused = nn.Linear(concat_fused.shape[-1], D).to(concat_fused.device)(concat_fused)
+            X_fused = concat_fused
+            fusion_weights = None
+        else:
+            # 默认只使用显式融合
+            fusion_weights = alpha
+        
+        return X_fused, fusion_weights
+
+
+class PredictionLayer(nn.Module):
+    """
+    预测层：使用融合特征进行最终预测
+    """
+    def __init__(self, configs, patch_len, stride):
+        super(PredictionLayer, self).__init__()
+        self.configs = configs
+        self.pred_len = configs.pred_len
+        self.seq_len = configs.seq_len
+        self.patch_len = patch_len
+        self.stride = stride
+        
+        # 计算patch数量
+        self.patch_nums = int((configs.seq_len - patch_len) / stride + 2)
+        # 使用d_model作为特征维度
         self.head_nf = configs.d_model * self.patch_nums
         
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+        # 输出投影
+        if configs.task_name == 'long_term_forecast' or configs.task_name == 'short_term_forecast':
             self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
                                                  head_dropout=configs.dropout)
         else:
             raise NotImplementedError
         
-        # 归一化层
-        self.normalize_layers = Normalize(configs.enc_in, affine=False)
-        
-        # Dropout
-        self.dropout = nn.Dropout(configs.dropout)
+        # 初始化LLM用于预测
+        self.llm_model = self._init_llm(configs)
+        self.tokenizer = self._init_tokenizer(configs)
     
     def _init_llm(self, configs):
         """初始化LLM模型"""
         if configs.llm_model == 'BERT':
             # 直接创建BERT配置
-            self.bert_config = BertConfig(
+            from transformers import BertConfig, BertModel
+            bert_config = BertConfig(
                 vocab_size=30522,
                 hidden_size=768,
                 num_hidden_layers=configs.llm_layers,
@@ -348,12 +615,22 @@ class EnhancedTimeLLM(nn.Module):
             )
             
             # 创建BERT模型实例
-            self.llm_model = BertModel(self.bert_config)
+            llm_model = BertModel(bert_config)
             print("Created BERT model with random weights")
-            
-            # 创建BERT tokenizer
+        else:
+            raise Exception('Only BERT is supported in EnhancedTimeLLM')
+        
+        # 冻结LLM参数
+        for param in llm_model.parameters():
+            param.requires_grad = False
+        
+        return llm_model
+    
+    def _init_tokenizer(self, configs):
+        """初始化Tokenizer"""
+        if configs.llm_model == 'BERT':
             from transformers import BertTokenizerFast
-            self.tokenizer = BertTokenizerFast(
+            tokenizer = BertTokenizerFast(
                 vocab_file=None,
                 do_lower_case=True,
                 strip_accents=True,
@@ -362,123 +639,27 @@ class EnhancedTimeLLM(nn.Module):
             )
             # 添加特殊 tokens
             special_tokens = {'pad_token': '[PAD]', 'cls_token': '[CLS]', 'sep_token': '[SEP]'}
-            self.tokenizer.add_special_tokens(special_tokens)
+            tokenizer.add_special_tokens(special_tokens)
             print("Created BERT tokenizer with basic configuration")
         else:
             raise Exception('Only BERT is supported in EnhancedTimeLLM')
         
-        # 冻结LLM参数
-        for param in self.llm_model.parameters():
-            param.requires_grad = False
+        return tokenizer
     
-    def extract_external_factors(self, x_mark_enc):
+    def forward(self, fused_features, batch_stats, n_vars, d_model):
         """
-        从时间标记中提取外部因素
+        前向传播
         
         参数:
-            x_mark_enc: [B, T, D] 时间标记特征
+            fused_features: [B, L, D] 融合后的特征
+            batch_stats: dict 批次统计特征
+            n_vars: int 变量数量
+            d_model: int 模型维度
         
         返回:
-            external_factors: dict 外部因素字典
+            dec_out: [B, T, N] 预测结果
         """
-        B, T, D = x_mark_enc.shape
-        external_factors = {
-            'weather': [],
-            'holiday': [],
-            'time_features': []
-        }
-        
-        for b in range(B):
-            # 提取天气特征（假设在x_mark_enc中）
-            # 这里需要根据实际数据结构调整
-            weather_features = {
-                'temperature': 20.0,  # 默认值，需要从实际数据中提取
-                'humidity': 50.0,
-                'wind_speed': 2.0
-            }
-            external_factors['weather'].append(weather_features)
-            
-            # 提取节假日特征
-            holiday_features = {
-                'is_holiday': False,
-                'holiday_name': 'ordinary day'
-            }
-            external_factors['holiday'].append(holiday_features)
-            
-            # 提取时间特征
-            time_features = {
-                'hour': int(x_mark_enc[b, 0, 3].item()) if D > 3 else 12,
-                'dayofweek': int(x_mark_enc[b, 0, 2].item()) if D > 2 else 0,
-                'is_weekend': False
-            }
-            external_factors['time_features'].append(time_features)
-        
-        return external_factors
-    
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors)
-            return dec_out[:, -self.pred_len:, :]
-        return None
-    
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
-        # 1. 原始时间序列编码分支
-        # 归一化
-        x_enc = self.normalize_layers(x_enc, 'norm')
-        
-        B, T, N = x_enc.size()
-        x_enc_reshaped = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
-        
-        # 计算统计特征
-        min_values = torch.min(x_enc_reshaped, dim=1)[0]
-        max_values = torch.max(x_enc_reshaped, dim=1)[0]
-        medians = torch.median(x_enc_reshaped, dim=1).values
-        lags = self.calcute_lags(x_enc_reshaped)
-        trends = x_enc_reshaped.diff(dim=1).sum(dim=1)
-        
-        # 恢复x_enc形状
-        x_enc = x_enc_reshaped.reshape(B, N, T).permute(0, 2, 1).contiguous()
-        
-        # 时序特征提取
-        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
-        x_enc = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, n_vars = self.patch_embedding(x_enc)
-        
-        # 重编程
-        enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
-        
-        # 2. LLM外因建模分支
-        semantic_features = None
-        impact_scores = None
-        
-        if self.use_external_factors:
-            if self.use_llm_semantic and external_factors is not None:
-                # 使用LLM语义建模外部因素
-                semantic_features, impact_scores = self.llm_semantic_generator.llm_external_model(external_factors)
-                # 投影到LLM隐藏状态维度
-                semantic_features = self.dimension_projection(semantic_features)
-            else:
-                # 传统外部因素嵌入
-                if x_mark_enc.shape[-1] >= 4:
-                    semantic_features = self.external_embedding(x_mark_enc[:, :, :4])
-                    semantic_features = semantic_features.mean(dim=1, keepdim=True).repeat(1, enc_out.shape[1], 1)
-                else:
-                    semantic_features = torch.zeros_like(enc_out)
-        
-        # 3. 融合层
-        if self.use_fusion and semantic_features is not None:
-            # 动态融合：X_fused = X_base + α·X_external
-            enc_out, fusion_weights = self.dynamic_fusion(enc_out, semantic_features, impact_scores)
-        
-        # 4. 预测层
-        # 生成Prompt embedding（使用统计特征）
-        batch_stats = {
-            'min_values': min_values.squeeze(-1).cpu().numpy(),
-            'max_values': max_values.squeeze(-1).cpu().numpy(),
-            'median_values': medians.squeeze(-1).cpu().numpy(),
-            'trends': trends.squeeze(-1).cpu().numpy(),
-            'lags': lags.cpu().numpy()
-        }
+        B = fused_features.shape[0]
         
         # 构造基础Prompt
         prompts = []
@@ -500,15 +681,15 @@ class EnhancedTimeLLM(nn.Module):
         
         # 生成Prompt embedding
         prompt = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).input_ids
-        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))
+        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(fused_features.device))
         
         # 拼接prompt embedding和融合特征
-        llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
+        llama_enc_out = torch.cat([prompt_embeddings, fused_features], dim=1)
         
         # LLM处理
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
-        # 使用configs.d_model作为特征维度
-        dec_out = dec_out[:, :, :self.configs.d_model]
+        # 使用d_model作为特征维度
+        dec_out = dec_out[:, :, :d_model]
         
         # 重塑和投影
         dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
@@ -516,19 +697,7 @@ class EnhancedTimeLLM(nn.Module):
         dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
         dec_out = dec_out.permute(0, 2, 1).contiguous()
         
-        # 反归一化
-        dec_out = self.normalize_layers(dec_out, 'denorm')
-        
         return dec_out
-    
-    def calcute_lags(self, x_enc):
-        q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
-        k_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
-        res = q_fft * torch.conj(k_fft)
-        corr = torch.fft.irfft(res, dim=-1)
-        mean_value = torch.mean(corr, dim=1)
-        _, lags = torch.topk(mean_value, self.top_k, dim=-1)
-        return lags
 
 
 class ReprogrammingLayer(nn.Module):

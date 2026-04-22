@@ -137,46 +137,98 @@ class LLMExternalFactorModel(nn.Module):
             prompt_parts = [
                 f"<|start_prompt|>",
                 "Task: Analyze the impact of external factors on people flow.",
-                "Please analyze how the following external factors will affect people flow:",
+                "You are an expert in analyzing how external factors affect people flow patterns.",
+                "Please analyze the following external factors and provide a detailed impact assessment:",
                 "\nExternal Factors:",
             ]
             
-            # 天气因素
+            # 天气因素 - 更详细的描述
             if factors.get('weather'):
                 weather = factors['weather']
                 temp = weather.get('temperature', 20.0)
                 humidity = weather.get('humidity', 50.0)
                 wind_speed = weather.get('wind_speed', 2.0)
-                weather_desc = f"Weather: {temp:.1f}°C, {humidity:.1f}% humidity, {wind_speed:.1f} m/s wind speed"
+                
+                # 天气状况描述
+                if temp > 30:
+                    temp_desc = "very hot"
+                elif temp > 25:
+                    temp_desc = "hot"
+                elif temp > 20:
+                    temp_desc = "warm"
+                elif temp > 15:
+                    temp_desc = "mild"
+                elif temp > 10:
+                    temp_desc = "cool"
+                else:
+                    temp_desc = "cold"
+                
+                if humidity > 70:
+                    humidity_desc = "very humid"
+                elif humidity > 50:
+                    humidity_desc = "humid"
+                elif humidity > 30:
+                    humidity_desc = "moderate humidity"
+                else:
+                    humidity_desc = "dry"
+                
+                if wind_speed > 10:
+                    wind_desc = "very windy"
+                elif wind_speed > 5:
+                    wind_desc = "windy"
+                elif wind_speed > 2:
+                    wind_desc = "breezy"
+                else:
+                    wind_desc = "calm"
+                
+                weather_desc = f"Weather: {temp_desc} ({temp:.1f}°C), {humidity_desc} ({humidity:.1f}%), {wind_desc} ({wind_speed:.1f} m/s)"
                 prompt_parts.append(f"- {weather_desc}")
             
-            # 节假日因素
+            # 节假日因素 - 更详细的描述
             if factors.get('holiday'):
                 holiday = factors['holiday']
                 is_holiday = holiday.get('is_holiday', False)
                 holiday_name = holiday.get('holiday_name', 'ordinary day')
-                holiday_desc = f"Holiday: {'Yes' if is_holiday else 'No'}, {'holiday' if is_holiday else 'working day'}"
+                
                 if is_holiday:
-                    holiday_desc += f" ({holiday_name})"
+                    holiday_desc = f"Holiday: Yes, {holiday_name} - a major holiday with expected increased people flow"
+                else:
+                    holiday_desc = f"Holiday: No, regular working day - normal people flow patterns"
                 prompt_parts.append(f"- {holiday_desc}")
             
-            # 时间特征
+            # 时间特征 - 更详细的描述
             if factors.get('time_features'):
                 time_feat = factors['time_features']
                 hour = time_feat.get('hour', 12)
                 dayofweek = time_feat.get('dayofweek', 0)
                 is_weekend = time_feat.get('is_weekend', False)
+                
                 weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
                 weekday_name = weekday_names[dayofweek] if 0 <= dayofweek < 7 else 'Unknown'
-                time_desc = f"Time: {hour}:00, {weekday_name}, {'weekend' if is_weekend else 'weekday'}"
+                
+                # 时间段描述
+                if 7 <= hour <= 9:
+                    time_period = "morning rush hour"
+                elif 12 <= hour <= 14:
+                    time_period = "lunchtime"
+                elif 17 <= hour <= 19:
+                    time_period = "evening rush hour"
+                elif 20 <= hour <= 22:
+                    time_period = "evening leisure time"
+                else:
+                    time_period = "off-peak hours"
+                
+                time_desc = f"Time: {hour}:00 ({time_period}), {weekday_name}, {'weekend' if is_weekend else 'weekday'}"
                 prompt_parts.append(f"- {time_desc}")
             
-            # 任务指令
+            # 任务指令 - 更明确的输出要求
             prompt_parts.extend([
-                "\nPlease provide:",
-                "1. A brief analysis of how these factors will affect people flow",
-                "2. An estimated impact score from 0 to 1, where 0 means no impact and 1 means significant impact",
-                "3. Key factors that will most influence people flow",
+                "\nPlease provide a comprehensive analysis:",
+                "1. How each factor will individually affect people flow",
+                "2. How these factors interact with each other",
+                "3. An overall impact score from 0 to 1, where 0 means no impact and 1 means maximum impact",
+                "4. A multi-dimensional weight vector indicating the relative importance of each factor",
+                "5. A brief prediction of people flow patterns based on these factors",
                 "<|end_prompt|>"
             ])
             
@@ -195,6 +247,7 @@ class LLMExternalFactorModel(nn.Module):
         返回:
             semantic_features: [B, D] LLM语义特征
             impact_scores: [B, 1] 影响程度分数
+            factor_weights: [B, 3] 多维权重向量（天气、节假日、时间）
         """
         # 构造Prompt
         prompts = self.construct_external_prompt(external_factors)
@@ -225,7 +278,32 @@ class LLMExternalFactorModel(nn.Module):
         # 预测影响程度
         impact_scores = self.impact_prediction(cls_embedding)
         
-        return semantic_features, impact_scores
+        # 生成多维权重向量（天气、节假日、时间）
+        factor_weights = self._generate_factor_weights(cls_embedding)
+        
+        return semantic_features, impact_scores, factor_weights
+    
+    def _generate_factor_weights(self, cls_embedding):
+        """
+        生成多维权重向量
+        
+        参数:
+            cls_embedding: [B, D] LLM隐藏状态
+        
+        返回:
+            factor_weights: [B, 3] 多维权重向量（天气、节假日、时间）
+        """
+        # 权重预测网络
+        weight_network = nn.Sequential(
+            nn.Linear(self.configs.llm_dim, self.configs.d_model),
+            nn.ReLU(),
+            nn.Linear(self.configs.d_model, 3),  # 3个因素：天气、节假日、时间
+            nn.Softmax(dim=-1)  # 归一化权重
+        ).to(cls_embedding.device)
+        
+        factor_weights = weight_network(cls_embedding)
+        
+        return factor_weights
 
 
 class ExternalFactorProcessor:
@@ -352,6 +430,52 @@ class LLMSemanticFeatureGenerator:
         semantic_features, impact_scores = self.llm_external_model(external_factors)
         
         return semantic_features, impact_scores
+    
+    def extract_and_embed_external_factors(self, x_mark_enc, seq_len):
+        """
+        提取并嵌入外部因素（用于简单拼接模式）
+        
+        参数:
+            x_mark_enc: [B, T, D] 时间标记特征
+            seq_len: int 序列长度
+        
+        返回:
+            semantic_features: [B, seq_len, D] 嵌入后的外部因素特征
+        """
+        B, T, D = x_mark_enc.shape
+        
+        # 提取外部因素（假设前4个特征是天气和节假日）
+        if D >= 4:
+            external_features = x_mark_enc[:, :, :4]
+            # 简单嵌入
+            embedding = nn.Linear(4, 768).to(x_mark_enc.device)
+            semantic_features = embedding(external_features)
+            # 调整长度以匹配时序特征
+            if semantic_features.shape[1] != seq_len:
+                # 重复或截断以匹配长度
+                if semantic_features.shape[1] > seq_len:
+                    semantic_features = semantic_features[:, :seq_len, :]
+                else:
+                    semantic_features = semantic_features.repeat(1, seq_len // semantic_features.shape[1] + 1, 1)[:, :seq_len, :]
+        else:
+            # 如果没有足够的特征，返回零向量
+            semantic_features = torch.zeros(B, seq_len, 768).to(x_mark_enc.device)
+        
+        return semantic_features
+    
+    def llm_external_model(self, external_factors):
+        """
+        调用LLM外部因素模型
+        
+        参数:
+            external_factors: 外部因素字典列表
+        
+        返回:
+            semantic_features: [B, D] 语义特征
+            impact_scores: [B, 1] 影响程度分数
+            factor_weights: [B, 3] 多维权重向量
+        """
+        return self.llm_external_model.forward(external_factors)
 
 
 # 测试代码
