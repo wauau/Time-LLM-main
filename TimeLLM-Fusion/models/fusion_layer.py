@@ -4,16 +4,15 @@ import torch.nn as nn
 class FusionLayer(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.attn = nn.Linear(dim, dim)
+        self.proj = nn.Linear(2, dim)  # 两个权重 → 映射到特征空间
 
-    def forward(self, x_base, x_ext):
-        # x_base: [B, T, D]
-        # x_ext:  [B, D]
+    def forward(self, x_base, llm_weights):
+        # llm_weights: [B, 2]
 
-        x_ext = x_ext.unsqueeze(1).repeat(1, x_base.size(1), 1)
+        weight_feature = self.proj(llm_weights)  # [B, D]
 
-        alpha = torch.softmax(self.attn(x_ext), dim=-1)
+        weight_feature = weight_feature.unsqueeze(1).repeat(1, x_base.size(1), 1)
 
-        x_fused = x_base + alpha * x_ext
+        x_fused = x_base + weight_feature
 
-        return x_fused, alpha
+        return x_fused, llm_weights

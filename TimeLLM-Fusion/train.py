@@ -20,4 +20,4 @@ for epoch in range(config.epochs):
     loss.backward()
     optimizer.step()
     print(f"Epoch {epoch}, Loss: {loss.item()}")
-    print("Sample weights:", alpha[0][0][:5])
+    print("Sample weights:", alpha[0])

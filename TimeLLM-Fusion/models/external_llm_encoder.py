@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import re
 from transformers import BertConfig, BertModel, BertTokenizerFast
 
-class ExternalLLMEncoder(nn.Module):
-    def __init__(self, out_dim=64):
+class ExternalLLMReasoner(nn.Module):
+    def __init__(self, llm_model=None, tokenizer=None):
         super().__init__()
         # 使用本地配置，不依赖下载
         self.config = BertConfig(
@@ -24,10 +25,10 @@ class ExternalLLMEncoder(nn.Module):
         )
         
         # 创建BERT模型实例
-        self.llm = BertModel(self.config)
+        self.llm = llm_model if llm_model else BertModel(self.config)
         
         # 创建本地tokenizer
-        self.tokenizer = BertTokenizerFast(
+        self.tokenizer = tokenizer if tokenizer else BertTokenizerFast(
             vocab_file=None,
             do_lower_case=True,
             strip_accents=True,
@@ -37,24 +38,66 @@ class ExternalLLMEncoder(nn.Module):
         # 添加特殊 tokens
         special_tokens = {'pad_token': '[PAD]', 'cls_token': '[CLS]', 'sep_token': '[SEP]'}
         self.tokenizer.add_special_tokens(special_tokens)
-        
-        self.proj = nn.Linear(768, out_dim)
 
     def build_prompt(self, item):
         return f"""
-        Date: {item['date']}
-        Weather: {item['weather']}
-        Holiday: {item['holiday']}
-        Predict impact on crowd flow (0-1)
+        日期: {item['date']}
+        天气: {item['weather']}
+        节假日: {item['holiday']}
+
+        请分析各因素对人流影响：
+        1. 天气影响权重（0-1）
+        2. 节假日影响权重（0-1）
+        输出格式：
+        weather: x.xx
+        holiday: x.xx
+        reason: xxx
         """
+
+    def parse_output(self, text):
+        # 简单解析，实际应用中可能需要更复杂的处理
+        try:
+            weather_match = re.search(r"weather:\s*(\d\.\d+)", text)
+            holiday_match = re.search(r"holiday:\s*(\d\.\d+)", text)
+            if weather_match and holiday_match:
+                weather = float(weather_match.group(1))
+                holiday = float(holiday_match.group(1))
+            else:
+                # 如果解析失败，返回默认值
+                weather = 0.5
+                holiday = 0.5
+        except:
+            # 异常情况下返回默认值
+            weather = 0.5
+            holiday = 0.5
+        return torch.tensor([weather, holiday])
 
     def forward(self, batch_external):
         prompts = [self.build_prompt(x) for x in batch_external]
 
-        inputs = self.tokenizer(prompts, return_tensors="pt",
-                                 padding=True, truncation=True)
-
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        
+        # 使用前向传播获取隐藏状态，然后模拟推理
         outputs = self.llm(**inputs)
-        hidden = outputs.last_hidden_state[:, -1, :]
-
-        return self.proj(hidden)
+        
+        # 简单模拟LLM推理结果，实际应用中应该使用支持生成的模型
+        # 这里我们直接基于输入特征生成权重
+        batch_size = len(batch_external)
+        weights = []
+        
+        for i in range(batch_size):
+            item = batch_external[i]
+            # 基于节假日和天气简单生成权重
+            if item['holiday'] != 'None':
+                holiday_weight = 0.7
+                weather_weight = 0.3
+            else:
+                if item['weather'] == 'sunny':
+                    weather_weight = 0.6
+                    holiday_weight = 0.4
+                else:
+                    weather_weight = 0.4
+                    holiday_weight = 0.6
+            weights.append(torch.tensor([weather_weight, holiday_weight]))
+        
+        return torch.stack(weights)  # [B, 2]
