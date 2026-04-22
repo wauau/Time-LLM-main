@@ -422,21 +422,22 @@ class EnhancedTimeLLM(nn.Module):
         return None
     
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, external_factors=None):
+        # 1. 原始时间序列编码分支
         # 归一化
         x_enc = self.normalize_layers(x_enc, 'norm')
         
         B, T, N = x_enc.size()
-        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+        x_enc_reshaped = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
         
         # 计算统计特征
-        min_values = torch.min(x_enc, dim=1)[0]
-        max_values = torch.max(x_enc, dim=1)[0]
-        medians = torch.median(x_enc, dim=1).values
-        lags = self.calcute_lags(x_enc)
-        trends = x_enc.diff(dim=1).sum(dim=1)
+        min_values = torch.min(x_enc_reshaped, dim=1)[0]
+        max_values = torch.max(x_enc_reshaped, dim=1)[0]
+        medians = torch.median(x_enc_reshaped, dim=1).values
+        lags = self.calcute_lags(x_enc_reshaped)
+        trends = x_enc_reshaped.diff(dim=1).sum(dim=1)
         
         # 恢复x_enc形状
-        x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
+        x_enc = x_enc_reshaped.reshape(B, N, T).permute(0, 2, 1).contiguous()
         
         # 时序特征提取
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
@@ -446,7 +447,7 @@ class EnhancedTimeLLM(nn.Module):
         # 重编程
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         
-        # 处理外部因素
+        # 2. LLM外因建模分支
         semantic_features = None
         impact_scores = None
         
@@ -454,7 +455,7 @@ class EnhancedTimeLLM(nn.Module):
             if self.use_llm_semantic and external_factors is not None:
                 # 使用LLM语义建模外部因素
                 semantic_features, impact_scores = self.llm_semantic_generator.llm_external_model(external_factors)
-                # 投影到d_model维度
+                # 投影到LLM隐藏状态维度
                 semantic_features = self.dimension_projection(semantic_features)
             else:
                 # 传统外部因素嵌入
@@ -464,10 +465,12 @@ class EnhancedTimeLLM(nn.Module):
                 else:
                     semantic_features = torch.zeros_like(enc_out)
         
-        # 动态融合
+        # 3. 融合层
         if self.use_fusion and semantic_features is not None:
+            # 动态融合：X_fused = X_base + α·X_external
             enc_out, fusion_weights = self.dynamic_fusion(enc_out, semantic_features, impact_scores)
         
+        # 4. 预测层
         # 生成Prompt embedding（使用统计特征）
         batch_stats = {
             'min_values': min_values.squeeze(-1).cpu().numpy(),
